@@ -8,6 +8,6 @@ can be combined with other Elements to assemble a fully functional pipeline.
 + `element-volume` features a DataJoint pipeline design for lab related information.
 
 + `element-volume` is not a complete workflow by itself, but rather a modular design of
-  tables and dependencies. 
+  tables and dependencies.
 
 + `element-volume` can be flexibly attached to any DataJoint workflow.

@@ -1,6 +1,6 @@
 # Concepts
 
-## Volumetric Data
+<!-- ## Volumetric Data -->
 
 ## Key Partnerships
 
@@ -13,10 +13,10 @@ include:
 
 ## Element architecture
 
-<!-- ![element volume diagram](https://raw.githubusercontent.com/datajoint/element-volume/images/volume_diagram.svg) -->
+<!--![element volume diagram](https://raw.githubusercontent.com/datajoint/element-volume/images/volume_diagram.svg)-->
 
 ### `volume` schema ([API docs](https://datajoint.com/docs/elements/element-volume/api/element_volume))
 
-| Table                 | Description                                                  |
-| ------------------    | -------------------------------------------------------------|
-| Example               | Description.                                                 |
+| Table                 | Description                                                 |
+| ------------------    | ------------------------------------------------------------|
+| Example               | Description.                                                |
