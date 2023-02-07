@@ -118,3 +118,4 @@ temp/*
 
 # mkdocs documentation
 docs/site
+temp*

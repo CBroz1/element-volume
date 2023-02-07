@@ -1,32 +1,44 @@
+import logging
 import os
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 from element_interface.utils import find_full_path
 from intern import array
 from PIL import Image
+from requests import HTTPError
 
 from .. import volume
+
+logger = logging.getLogger("datajoint")
 
 
 class BossDBInterface(array):
     def __init__(
         self,
         channel: Union[Tuple, str],
-        session_key: dict = None,
-        resolution_id: str = None,
-        volume_id: str = None,
+        session_key: Optional[dict] = None,
+        volume_id: Optional[str] = None,
         **kwargs,
     ) -> None:
-        super().__init__(channel=channel, **kwargs)
+
+        try:
+            _ = super().__init__(channel=channel, **kwargs)
+        except HTTPError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"URL does not exist {channel}")
+                return False
+            else:
+                raise e
+
         self._session_key = session_key or dict()
 
         # If not passed resolution or volume IDs, use the following defaults:
         self._volume_key = dict(
             volume_id=volume_id or self.collection_name + "/" + self.experiment_name,
-            resolution_id=resolution_id or self.resolution,
+            resolution_id=self.resolution,
         )
 
     def _infer_session_dir(self):
@@ -111,8 +123,19 @@ class BossDBInterface(array):
             output = (*output, slice(start, stop))
         return output
 
-    def _import_slices(
-        self, slice_key: Tuple[Union[int, slice]], extension: str = ".png"
+    def _slice_key_to_string(self, slice_key: Tuple[Union[int, slice]]) -> str:
+        outputs = []
+        for item in slice_key:
+            if item.stop == item.start + 1:
+                outputs.apend(f"{item.start}")
+            else:
+                outputs.append(f"{item.start}:{item.stop}")
+        return "[" + ",".join(outputs) + "]"
+
+    def _download_slices(
+        self,
+        slice_key: Tuple[Union[int, slice]],
+        extension: str = ".png",
     ):
         xs, ys, zs = self._normalize_key(key=slice_key)
         data = self._fetch_slice_data(xs, ys, zs)
@@ -123,7 +146,6 @@ class BossDBInterface(array):
             volume.get_session_directory(self._session_key) or self._infer_session_dir()
         )
         file_name = f"Res{self.resolution}_Zoom{zoom_id}_Z%d{extension}"
-        file_path_relative = session_path + file_name
         file_path_full = str(
             find_full_path(volume.get_vol_root_data_dir(), session_path) / file_name
         )
@@ -133,22 +155,15 @@ class BossDBInterface(array):
             # When saving data, 0-indexed based on slices fetched
             Image.fromarray(data[z - zs[0]]).save(file_path_full % z)
 
-            volume.Volume.Slice.insert1(
-                dict(
-                    **self._volume_key,
-                    id=z,
-                    zoom_id=zoom_id,
-                    file_path=file_path_relative % z,
-                )
-            )
-
     def download(
         self,
         slice_key: Union[Tuple[Union[int, slice]], str],
+        save_images: bool = False,
         extension: str = ".png",
     ):
         if isinstance(slice_key, str):
             slice_key = self._string_to_slice_key(slice_key)
         self._import_resolution()
         self._import_volume()
-        self._import_slices(slice_key, extension)
+        if save_images:
+            self._download_slices(slice_key, extension)

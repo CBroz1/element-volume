@@ -1,9 +1,14 @@
 import importlib
 import inspect
 import logging
-import pathlib
+from pathlib import Path
+from typing import Optional
 
 import datajoint as dj
+from datajoint.errors import DataJointError
+from element_interface.utils import find_full_path
+
+from .readers import BossDBInterface
 
 logger = logging.getLogger("datajoint")
 
@@ -32,6 +37,8 @@ def activate(
     Dependencies:
     Tables:
         Session: A parent table to Volume
+        URLs: A table with any of the following volume_url, segmentation_url,
+            connectome_url
     Functions:
         get_vol_root_data_dir: Returns absolute path for root data director(y/ies) with
             all volumetric data, as a list of string(s).
@@ -43,7 +50,7 @@ def activate(
         linking_module = importlib.import_module(linking_module)
     assert inspect.ismodule(
         linking_module
-    ), "The argument 'dependency' must be a module's name or a module"
+    ), "The argument 'linking_module' must be a module's name or a module"
 
     global _linking_module
     _linking_module = linking_module
@@ -56,7 +63,7 @@ def activate(
     )
 
 
-# -------------- Functions required by the elements-ephys  ---------------
+# -------------------------- Functions required by the Element -------------------------
 
 
 def get_vol_root_data_dir() -> list:
@@ -68,7 +75,7 @@ def get_vol_root_data_dir() -> list:
         A list of the absolute path(s) to ephys data directories.
     """
     root_directories = _linking_module.get_vol_root_data_dir()
-    if isinstance(root_directories, (str, pathlib.Path)):
+    if isinstance(root_directories, (str, Path)):
         root_directories = [root_directories]
 
     return root_directories
@@ -87,6 +94,9 @@ def get_session_directory(session_key: dict) -> str:
     return _linking_module.get_session_directory(session_key)
 
 
+# --------------------------------------- Schema ---------------------------------------
+
+
 @schema
 class Resolution(dj.Lookup):
     definition = """ # Resolution of stored data
@@ -100,25 +110,7 @@ class Resolution(dj.Lookup):
 
 
 @schema
-class Zoom(dj.Lookup):
-    definition = """ # Image cutoffs when taking a subset of a given slice
-    zoom_id: varchar(32) # Shorthand for zoom convention
-    ---
-    first_start: int # Starting voxel in first dimension (X if taking Z slices)
-    first_end=null: int # Ending voxel plus 1 in first dimension
-    second_start: int # Starting voxel in second dimension (Y if taking Z slices)
-    second_end=null: int # Ending voxel plus 1 in second dimension
-    """
-
-    contents = [
-        ("Full Image", 0, None, 0, None),
-    ]
-
-
-@schema
 class Volume(dj.Manual):
-    # NOTE: Session added as nullable because data downloaded from BossDB would not be
-    # associated with a session. Should we enforce this association?
     definition = """ # Dataset of a contiguous volume
     volume_id : varchar(32) # shorthand for this volume
     -> Resolution
@@ -129,17 +121,152 @@ class Volume(dj.Manual):
     x_size: int # total number of voxels in x dimension
     slicing_dimension='z': enum('x','y','z') # perspective of slices
     channel: varchar(64) # data type or modality (e.g., EM, segmentation, etc.)
-    url=null : varchar(255) # dataset URL
+    -> [nullable] URLs.Volume
+    volume_data = null: longblob
     """
 
-    class Slice(dj.Part):
-        # NOTE: The table architecture makes sense as part table, but fetching from
-        # BossDB might entail a subset of slices, which doesn't align with the design
-        # goal of always ingesting master/parts at the same time
-        definition = """ # Slice of a given volume
-        -> Volume
-        id: int # Nth voxel in slicing_dimension
-        -> Zoom
-        ---
-        file_path : varchar(255) # filepath relative to root data directory
+    @classmethod
+    def upload(
+        cls,
+        volume_key: dict,
+        session_key: Optional[dict] = None,
+        data_dir: Optional[str] = None,  # Local absolute path
+        **kwargs,
+    ):
+        # upload_increment (int):  For best performance, use be a multiple of 16.
+        #   With a lot of RAM, 64. If out-of-memory errors, decrease to 16. If issues
+        #   persist, try 8 or 4.
+
+        from .export.bossdb import bossdb_upload  # isort: skip
+
+        if not data_dir:
+            if not session_key:
+                raise DataJointError(
+                    "Please provide either data_dir or session key to upload"
+                )
+            data_dir = find_full_path(
+                get_vol_root_data_dir(),
+                get_session_directory(session_key),
+            )
+
+        (
+            url,
+            resolution_id,
+            z_size,
+            y_size,
+            x_size,
+            voxel_z_size,
+            voxel_y_size,
+            voxel_x_size,
+            voxel_unit,
+        ) = (Volume * Resolution & volume_key).fetch1(
+            "url",
+            "resolution_id",
+            "z_size",
+            "y_size",
+            "x_size",
+            "voxel_z_size",
+            "voxel_y_size",
+            "voxel_x_size",
+            "voxel_unit",
+        )
+        if resolution_id.isnumeric() and resolution_id != 0:
+            raise ValueError(
+                f"Cannot upload lower resolution data: resolution_id={resolution_id}"
+            )
+
+        bossdb_upload(
+            url=url,
+            data_dir=data_dir,
+            voxel_size=(voxel_z_size, voxel_y_size, voxel_x_size),
+            voxel_units=voxel_unit,
+            shape_zyx=(z_size, y_size, x_size),
+            source_channel=volume_key["volume_id"],
+            **kwargs,
+        )
+
+    @classmethod
+    def get_bossdb_data(self, volume_key: dict):
+        url, resolution = (Volume & volume_key).fetch1("url", "resolution_id")
+        return BossDBInterface(url, resolution=resolution)
+
+
+class SegmentationParamset(dj.Params):
+    definition = """
+    id: int
+    ---
+    params: longblob
+    segmentation_method: varchar(32)
+    """
+
+
+class SegmentationTask(dj.Manual):
+    definition = """
+    -> Volume
+    -> SegmentationParamset
+    ---
+    task_mode='load': enum('load', 'trigger')
+    -> [nullable] URLs.Segmentation
+    """
+
+
+class Segmentation(dj.Imported):
+    defintion = """
+    -> SegmentationTask
+    """
+
+    class Cell(dj.Part):
+        definition = """
+        call_id
         """
+
+    def make(self, key):
+        # NOTE: convert seg data to unit8 instead of uint64
+        raise NotImplementedError
+
+
+class CellMapping(dj.Computed):
+    definition = """
+    -> Segmentation.Cell
+    ---
+    -> imaging.Segmentation.Mask
+    """
+
+    def make(self, key):
+        raise NotImplementedError
+
+
+class ConnectomeParamset(dj.Params):
+    definition = """
+    id: int
+    ---
+    params: longblob
+    segmentation_method: varchar(32)
+    """
+
+
+class ConnectomeTask(dj.Manual):
+    defintion = """
+    -> Segmentation
+    -> ConnectomeParamset
+    ---
+    task_mode='load': enum('load', 'trigger')
+    -> [nullable] URLs.Connectome
+    """
+
+
+class Connectome(dj.Imported):
+    definition = """
+    -> ConnectomeTask
+    """
+
+    class Connection(dj.Part):
+        definition = """
+        ---
+        -> Cell.proj(pre_synaptic='cell_id')
+        -> Cell.proj(post_synaptic='cell_id')
+        connectivity_strength: float # TODO: rename based on existing standards
+        """
+
+    def make(self, key):
+        raise NotImplementedError
