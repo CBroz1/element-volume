@@ -1,16 +1,18 @@
 import logging
 import os
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import numpy as np
+from datajoint.errors import DataJointError
 from element_interface.utils import find_full_path
 from intern import array
 from PIL import Image
+from PIL.Image import _fromarray_typemap
 from requests import HTTPError
 
 from .. import volume
+from ..bossdb import BossDBURLs
 
 logger = logging.getLogger("datajoint")
 
@@ -25,11 +27,12 @@ class BossDBInterface(array):
     ) -> None:
 
         try:
-            _ = super().__init__(channel=channel, **kwargs)
+            super().__init__(channel=channel, **kwargs)
+            self._exists = True
         except HTTPError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"URL does not exist {channel}")
-                return False
+            if e.response.status_code == 404 and not kwargs.get("create_new", False):
+                self._exists = False
+                return
             else:
                 raise e
 
@@ -41,17 +44,19 @@ class BossDBInterface(array):
             resolution_id=self.resolution,
         )
 
+    @property
+    def exists(self):
+        return self._exists
+
     def _infer_session_dir(self):
-        root_dir = volume.get_vol_root_data_dir()
-        if isinstance(root_dir, Sequence):
-            root_dir = root_dir[0]
+        root_dir = volume.get_vol_root_data_dir()[0]
         inferred_dir = (
             f"{self.collection_name}/{self.experiment_name}/{self.channel_name}/"
         )
         os.makedirs(Path(root_dir) / inferred_dir, exist_ok=True)
         return inferred_dir
 
-    def _import_resolution(self):
+    def _import_resolution(self, skip_duplicates=True):
         volume.Resolution.insert1(
             dict(
                 resolution_id=self.resolution,  # integer 0-6
@@ -60,13 +65,10 @@ class BossDBInterface(array):
                 voxel_y_size=self.voxel_size[1],
                 voxel_x_size=self.voxel_size[2 if self.axis_order[0] == "Z" else 0],
             ),
-            skip_duplicates=True,
+            skip_duplicates=skip_duplicates,
         )
 
-    def _import_volume(self, volume_id: str = None):
-        if volume_id:
-            self._volume_key.update(dict(volume_id=self.volume_id))
-
+    def _import_volume(self, data: np.ndarray = None, skip_duplicates=True):
         volume.Volume.insert1(
             dict(
                 **self._session_key,
@@ -76,51 +78,31 @@ class BossDBInterface(array):
                 x_size=self.shape[2 if self.axis_order[0] == "Z" else 0],
                 channel=self.channel_name,
                 url=self.url,
+                volume_data=data,
             ),
-            skip_duplicates=True,
+            skip_duplicates=skip_duplicates,
         )
 
-    def _get_zoom_id(self, xs, ys):
-        _shape = self.shape
-        y_max, x_max = _shape[1:3] if self.axis_order[0] == "Z" else _shape[-2::1]
-        if xs[0] == 0 and ys[0] == 0 and xs[1] == x_max and ys[1] == y_max:
-            return "Full Image"
-        else:
-            zoom_id = f"X{xs[0]}-{xs[1]}_Y{ys[0]}-{ys[1]}"
-            volume.Zoom.insert1(
-                dict(
-                    zoom_id=zoom_id,
-                    first_start=xs[0],
-                    first_end=xs[1],
-                    second_start=ys[0],
-                    second_end=ys[1],
-                ),
-                skip_duplicates=True,
-            )
-            return zoom_id
-
-    def _fetch_slice_data(self, xs, ys, zs):
-        cutout = self.volume_provider.get_cutout(
-            self._channel, self.resolution, xs, ys, zs
-        )
-        if self.axis_order != self.volume_provider.get_axis_order():
-            data: np.ndarray = np.swapaxes(cutout, 0, 2)
-        else:
-            data: np.ndarray = cutout
-        # NOTE: does not collapse slice by dimension like array.__getitem___ for
-        # convenience when loading into volume.Volume.Slice table
-        return data
+    def _import_segmentaiton(self):
+        pass
 
     def _string_to_slice_key(self, string_key: str) -> Tuple:
         output = tuple()
         items = string_key.strip("[]").split(",")
-        for item in items:
-            if ":" in item:
+        for index, item in enumerate(items):
+            if item == ":":  # select all for dimension
+                start, stop = (0, self.shape[index])
+            elif ":" in item:  # select slice of dimension
                 start, stop = list(map(int, item.split(":")))
-            else:
+            else:  # select a single slice
                 start = int(item)
                 stop = start + 1
             output = (*output, slice(start, stop))
+        if len(output) == 1:  # If only on dimension provided, assume Z
+            if self.axis_order[0] == "Z":
+                return (output[0], slice(0, self.shape[1]), slice(0, self.shape[1]))
+            else:
+                return (slice(0, self.shape[0]), slice(0, self.shape[1]), output[0])
         return output
 
     def _slice_key_to_string(self, slice_key: Tuple[Union[int, slice]]) -> str:
@@ -135,35 +117,90 @@ class BossDBInterface(array):
     def _download_slices(
         self,
         slice_key: Tuple[Union[int, slice]],
+        data: np.ndarray,
         extension: str = ".png",
+        image_mode: str = None,
     ):
-        xs, ys, zs = self._normalize_key(key=slice_key)
-        data = self._fetch_slice_data(xs, ys, zs)
-        zoom_id = self._get_zoom_id(xs, ys)
 
-        # If dir provided by get_session, use that. Else infer and mkdir
-        session_path = (
-            volume.get_session_directory(self._session_key) or self._infer_session_dir()
-        )
-        file_name = f"Res{self.resolution}_Zoom{zoom_id}_Z%d{extension}"
+        xs, ys, zs = self._normalize_key(key=slice_key)
+        zoom = f"ZoomX{xs[0]}-{xs[1]}_Y{ys[0]}-{ys[1]}"
+
+        # If associated session, use that dir. Else infer and mkdir
+        if self._session_key:
+            session_path = volume.get_session_directory(self._session_key)
+        else:
+            session_path = self._infer_session_dir()
+        file_name = f"Res{self.resolution}_{zoom}_Z%d{extension}"
         file_path_full = str(
             find_full_path(volume.get_vol_root_data_dir(), session_path) / file_name
         )
 
+        if len(data.shape) == 2:  # getitem returned single z-slice
+            data = data[np.newaxis, :]
+
         for z in range(zs[0], zs[1]):
             # Z is used as absolute reference within dataset
             # When saving data, 0-indexed based on slices fetched
-            Image.fromarray(data[z - zs[0]]).save(file_path_full % z)
+            Image.fromarray(data[z - zs[0]], mode=image_mode).save(file_path_full % z)
+            logger.info(f"Saved {file_path_full % z}")
 
-    def download(
+    def insert_channel_as_url(self, data_channel="Volume", skip_duplicates=True):
+        collection_key = dict(
+            collection_experiment=self.collection_name + "_" + self.experiment_name
+        )
+        with BossDBURLs.connection.transaction:
+            BossDBURLs.insert1(collection_key, skip_duplicates=skip_duplicates)
+            getattr(BossDBURLs, data_channel).insert1(
+                dict(
+                    url=f"bossdb://{self._channel.get_cutout_route()}", **collection_key
+                ),
+                skip_duplicates=skip_duplicates,
+            )
+
+    def load_data_into_element(
         self,
-        slice_key: Union[Tuple[Union[int, slice]], str],
+        table: str = "Volume",
+        slice_key: Union[Tuple[Union[int, slice]], str] = "[:]",  # Default full data
         save_images: bool = False,
+        save_ndarray: bool = False,
         extension: str = ".png",
+        skip_duplicates=False,
+        image_mode=None,
     ):
+        # NOTE: By accepting a slice here, we could download pngs and/or store ndarrays
+        # that are a subset of the full volume with x and y start/stop limits. These
+        # limits are not noted as part of the ndarray insert, but are tracked via
+        # filename for images. We could (a) prevent loading partial volumes or (b) add
+        # fields/tables to track this information. I previously included a Zoom table
+
         if isinstance(slice_key, str):
             slice_key = self._string_to_slice_key(slice_key)
-        self._import_resolution()
-        self._import_volume()
+
+        data = self.__getitem__(key=slice_key) if save_images or save_ndarray else None
+
+        if (
+            save_images
+            and not image_mode
+            and ((1, 1), str(data.dtype)) not in _fromarray_typemap
+        ):
+            image_mode_options = [i[1] for i in _fromarray_typemap]
+            raise DataJointError(
+                "Datatype is not supported for saving. Please select one of the "
+                + f"following image modes for saving: {image_mode_options}\n"
+                + "See also docs for PIL.Image.fromarray"
+            )
+
+        self._import_resolution(skip_duplicates=skip_duplicates)
+
+        if table == "Volume":
+            self._import_volume(
+                data=data if save_ndarray else None, skip_duplicates=skip_duplicates
+            )
+        elif table == "Segmentation":
+            data = data.astype("uint8")
+            self._import_segmentaiton()
+        elif table == "Connectome":
+            raise ValueError("BossDB API does not yet support fetching connectome.")
+
         if save_images:
-            self._download_slices(slice_key, extension)
+            self._download_slices(slice_key, data, extension, image_mode)
