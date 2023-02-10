@@ -70,8 +70,9 @@ class BossDBURLs(dj.Lookup):
 
         from .readers.bossdb import BossDBInterface  # isort: skip
 
-        master_key = dict(collection_experiment=f"{collection}_{experiment}")
-        base_url = f"bossdb://{collection}/{experiment}/"
+        collection_experiment = f"{collection}/{experiment}"
+        master_key = dict(collection_experiment=collection_experiment)
+        base_url = f"bossdb://{collection_experiment}/"
         vol_url = base_url + volume
         seg_url = base_url + segmentation
         con_url = base_url + connectome

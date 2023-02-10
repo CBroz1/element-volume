@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Optional
 
 import datajoint as dj
-from element_interface.utils import find_full_path
+from element_interface.utils import dict_to_uuid, find_full_path
 
-from .export.bossdb import bossdb_upload
+from .export.bossdb import BossDBUpload
 from .readers.bossdb import BossDBInterface
 
 logger = logging.getLogger("datajoint")
@@ -39,6 +39,7 @@ def activate(
         Session: A parent table to Volume
         URLs: A table with any of the following volume_url, segmentation_url,
             connectome_url
+        Mask: imaging segmentation mask for cell matching
     Functions:
         get_vol_root_data_dir: Returns absolute path for root data director(y/ies) with
             all volumetric data, as a list of string(s).
@@ -129,7 +130,7 @@ class Volume(dj.Manual):
     @classmethod
     def download(
         cls,
-        url: Optional[str],
+        url: str,
         downsampling: Optional[int] = 0,
         session_key: Optional[dict] = None,
         **kwargs,
@@ -189,29 +190,84 @@ class Volume(dj.Manual):
         else:
             data = None
 
-        bossdb_upload(
+        bossdb = BossDBUpload(
             url=url,
             raw_data=data,
             data_dir=data_dir,
-            voxel_size=(voxel_z_size, voxel_y_size, voxel_x_size),
+            voxel_size=(float(i) for i in (voxel_z_size, voxel_y_size, voxel_x_size)),
             voxel_units=voxel_unit,
-            shape_zyx=(z_size, y_size, x_size),
+            shape_zyx=(int(i) for i in (z_size, y_size, x_size)),
             resolution=downsampling,
-            source_channel=volume_key["volume_id"],
             **kwargs,
         )
+        bossdb.upload()
 
 
+@schema
 class SegmentationParamset(dj.Lookup):
     definition = """
-    id: int
+    paramset_idx: int
     ---
-    params: longblob
     segmentation_method: varchar(32)
-    unique index (params)
+    paramset_desc="": varchar(256)
+    params: longblob
+    paramset_hash: uuid
+    unique index (paramset_hash)
     """
 
+    @classmethod
+    def insert_new_params(
+        cls,
+        segmentation_method: str,
+        paramset_desc: str = "",
+        params: dict = {},
+        paramset_idx: int = None,
+    ):
+        """Inserts new parameters into the table.
 
+        Args:
+            segmentation_method (str): name of the clustering method.
+            paramset_desc (str): description of the parameter set
+            params (dict): clustering parameters
+            paramset_idx (int, optional): Unique parameter set ID. Defaults to None.
+        """
+        if paramset_idx is None:
+            paramset_idx = (
+                dj.U().aggr(cls, n="max(paramset_idx)").fetch1("n") or 0
+            ) + 1
+
+        param_dict = {
+            "segmentation_method": segmentation_method,
+            "paramset_desc": paramset_desc,
+            "params": params,
+            "paramset_idx": paramset_idx,
+            "paramset_hash": dict_to_uuid(
+                {**params, "segmentation_method": segmentation_method}
+            ),
+        }
+        param_query = cls & {"paramset_hash": param_dict["paramset_hash"]}
+
+        if param_query:  # If the specified param-set already exists
+            existing_paramset_idx = param_query.fetch1("paramset_idx")
+            if (
+                existing_paramset_idx == paramset_idx
+            ):  # If the existing set has the same paramset_idx: job done
+                return
+            else:  # If not same name: human error, trying to add the same paramset with different name
+                raise dj.DataJointError(
+                    f"The specified param-set already exists"
+                    f" - with paramset_idx: {existing_paramset_idx}"
+                )
+        else:
+            if {"paramset_idx": paramset_idx} in cls.proj():
+                raise dj.DataJointError(
+                    f"The specified paramset_idx {paramset_idx} already exists,"
+                    f" please pick a different one."
+                )
+            cls.insert1(param_dict)
+
+
+@schema
 class SegmentationTask(dj.Manual):
     definition = """
     -> Volume
@@ -222,8 +278,9 @@ class SegmentationTask(dj.Manual):
     """
 
 
+@schema
 class Segmentation(dj.Imported):
-    defintion = """
+    definition = """
     -> SegmentationTask
     ---
     segmentation_data=null: longblob
@@ -231,16 +288,25 @@ class Segmentation(dj.Imported):
 
     class Cell(dj.Part):
         definition = """
-        call_id
+        -> master
+        cell_id : int
         """
 
     def make(self, key):
         # NOTE: convert seg data to unit8 instead of uint64
-        task_mode = (SegmentationTask & key).fetch1("task_mode")
-        if task_mode == "trigger":
+        (task_mode, seg_method, resolution_id, url, params) = (
+            SegmentationTask * SegmentationParamset * Resolution & key
+        ).fetch1(
+            "task_mode",
+            "segmentation_method",
+            "downsampling",
+            "url",
+            "params",
+        )
+        if task_mode == "trigger" or seg_method.lower() != "bossdb":
             raise NotImplementedError
         else:
-            (SegmentationTask * Volume & key).fetch("experiment_")
+            self.download(url=url, downsampling=resolution_id, **params)
 
     @classmethod
     def download(
@@ -251,33 +317,87 @@ class Segmentation(dj.Imported):
         **kwargs,
     ):
         data = BossDBInterface(url, resolution=downsampling, session_key=session_key)
-        data.insert_channel_as_url(data_channel="Volume")
-        data.load_data_into_element(**kwargs)
+        data.load_data_into_element(table="Segmentation", **kwargs)
 
 
-class CellMapping(dj.Computed):
+@schema
+class CellMapping(dj.Computed):  # TODO: FIX cell table foreign key ref
     definition = """
     -> Segmentation.Cell
-    ---
-    -> imaging.Segmentation.Mask
+    -> Mask
     """
 
     def make(self, key):
         raise NotImplementedError
 
 
+@schema
 class ConnectomeParamset(dj.Lookup):
     definition = """
-    id: int
+    paramset_idx: int
     ---
-    params: longblob
     connectome_method: varchar(32)
-    unique index (params)
+    paramset_desc="": varchar(256)
+    params: longblob
+    paramset_hash: uuid
+    unique index (paramset_hash)
     """
 
+    @classmethod
+    def insert_new_params(
+        cls,
+        connectome_method: str,
+        paramset_desc: str,
+        params: dict,
+        paramset_idx: int = None,
+    ):
+        """Inserts new parameters into the table.
 
+        Args:
+            connectome_method (str): name of the clustering method.
+            paramset_desc (str): description of the parameter set
+            params (dict): clustering parameters
+            paramset_idx (int, optional): Unique parameter set ID. Defaults to None.
+        """
+        if paramset_idx is None:
+            paramset_idx = (
+                dj.U().aggr(cls, n="max(paramset_idx)").fetch1("n") or 0
+            ) + 1
+
+        param_dict = {
+            "connectome_method": connectome_method,
+            "paramset_desc": paramset_desc,
+            "params": params,
+            "paramset_idx": paramset_idx,
+            "paramset_hash": dict_to_uuid(
+                {**params, "connectome_method": connectome_method}
+            ),
+        }
+        param_query = cls & {"paramset_hash": param_dict["paramset_hash"]}
+
+        if param_query:  # If the specified param-set already exists
+            existing_paramset_idx = param_query.fetch1("paramset_idx")
+            if (
+                existing_paramset_idx == paramset_idx
+            ):  # If the existing set has the same paramset_idx: job done
+                return
+            else:  # If not same name: human error, trying to add the same paramset with different name
+                raise dj.DataJointError(
+                    f"The specified param-set already exists"
+                    f" - with paramset_idx: {existing_paramset_idx}"
+                )
+        else:
+            if {"paramset_idx": paramset_idx} in cls.proj():
+                raise dj.DataJointError(
+                    f"The specified paramset_idx {paramset_idx} already exists,"
+                    f" please pick a different one."
+                )
+            cls.insert1(param_dict)
+
+
+@schema
 class ConnectomeTask(dj.Manual):
-    defintion = """
+    definition = """
     -> Segmentation
     -> ConnectomeParamset
     ---
@@ -286,6 +406,7 @@ class ConnectomeTask(dj.Manual):
     """
 
 
+@schema
 class Connectome(dj.Imported):
     definition = """
     -> ConnectomeTask
@@ -293,9 +414,9 @@ class Connectome(dj.Imported):
 
     class Connection(dj.Part):
         definition = """
+        -> Segmentation.Cell.proj(pre_synaptic='cell_id')
+        -> Segmentation.Cell.proj(post_synaptic='cell_id')
         ---
-        -> Cell.proj(pre_synaptic='cell_id')
-        -> Cell.proj(post_synaptic='cell_id')
         connectivity_strength: float # TODO: rename based on existing standards
         """
 

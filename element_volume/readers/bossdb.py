@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import numpy as np
-from datajoint.errors import DataJointError
 from element_interface.utils import find_full_path
 from intern import array
 from PIL import Image
@@ -77,14 +76,19 @@ class BossDBInterface(array):
                 y_size=self.shape[1],
                 x_size=self.shape[2 if self.axis_order[0] == "Z" else 0],
                 channel=self.channel_name,
-                url=self.url,
+                collection_experiment=f"{self.collection_name}_{self.experiment_name}",
+                url=f"bossdb://{self._channel.get_cutout_route()}",
                 volume_data=data,
             ),
             skip_duplicates=skip_duplicates,
         )
 
-    def _import_segmentaiton(self):
-        pass
+    def _import_segmentation(self, data: np.ndarray = None, skip_duplicates=True):
+        volume.Segmentation.insert1(
+            dict(**self._volume_key, segmentation_data=data),
+            skip_duplicates=skip_duplicates,
+            allow_direct_insert=True,
+        )
 
     def _string_to_slice_key(self, string_key: str) -> Tuple:
         output = tuple()
@@ -109,7 +113,7 @@ class BossDBInterface(array):
         outputs = []
         for item in slice_key:
             if item.stop == item.start + 1:
-                outputs.apend(f"{item.start}")
+                outputs.append(f"{item.start}")
             else:
                 outputs.append(f"{item.start}:{item.stop}")
         return "[" + ",".join(outputs) + "]"
@@ -131,18 +135,19 @@ class BossDBInterface(array):
         else:
             session_path = self._infer_session_dir()
         file_name = f"Res{self.resolution}_{zoom}_Z%d{extension}"
-        file_path_full = str(
-            find_full_path(volume.get_vol_root_data_dir(), session_path) / file_name
-        )
+        file_path = find_full_path(volume.get_vol_root_data_dir(), session_path)
+        file_path_full = str(file_path / file_name)
 
+        if len(data.shape) == 1:  # if getitem returned single array, try unwrapping
+            data = data[0]
         if len(data.shape) == 2:  # getitem returned single z-slice
             data = data[np.newaxis, :]
 
         for z in range(zs[0], zs[1]):
-            # Z is used as absolute reference within dataset
+            # Z is used as absolute reference within dataset.
             # When saving data, 0-indexed based on slices fetched
             Image.fromarray(data[z - zs[0]], mode=image_mode).save(file_path_full % z)
-            logger.info(f"Saved {file_path_full % z}")
+        logger.info(f"Saved Z-slices {zs[0]} to {zs[1]}:\n{file_path}/")
 
     def insert_channel_as_url(self, data_channel="Volume", skip_duplicates=True):
         collection_key = dict(
@@ -183,22 +188,23 @@ class BossDBInterface(array):
             and not image_mode
             and ((1, 1), str(data.dtype)) not in _fromarray_typemap
         ):
-            image_mode_options = [i[1] for i in _fromarray_typemap]
-            raise DataJointError(
+            image_mode_options = set(i[0] for i in _fromarray_typemap.values())
+            raise ValueError(
                 "Datatype is not supported for saving. Please select one of the "
-                + f"following image modes for saving: {image_mode_options}\n"
+                + f"following and pass it as `image_mode`: {image_mode_options}\n"
                 + "See also docs for PIL.Image.fromarray"
             )
 
-        self._import_resolution(skip_duplicates=skip_duplicates)
+        self._import_resolution()
 
         if table == "Volume":
             self._import_volume(
                 data=data if save_ndarray else None, skip_duplicates=skip_duplicates
             )
         elif table == "Segmentation":
-            data = data.astype("uint8")
-            self._import_segmentaiton()
+            self._import_segmentation(
+                data=data if save_ndarray else None, skip_duplicates=skip_duplicates
+            )
         elif table == "Connectome":
             raise ValueError("BossDB API does not yet support fetching connectome.")
 

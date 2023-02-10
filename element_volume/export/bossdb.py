@@ -3,8 +3,16 @@ from typing import Optional, Tuple
 
 import numpy as np
 from datajoint.errors import DataJointError
-from intern.convenience.array import _BossDBVolumeProvider
+from intern.convenience.array import _BossDBVolumeProvider, _parse_bossdb_uri
+from intern.remote.boss import BossRemote
+from intern.resource.boss.resource import (
+    ChannelResource,
+    CollectionResource,
+    CoordinateFrameResource,
+    ExperimentResource,
+)
 from PIL import Image
+from requests import HTTPError
 from tqdm.auto import tqdm
 
 from ..readers.bossdb import BossDBInterface
@@ -12,101 +20,201 @@ from ..readers.bossdb import BossDBInterface
 logger = logging.getLogger("datajoint")
 
 
-def bossdb_upload(
-    url: str,
-    data_dir: str,  # Local absolute path
-    voxel_size: Tuple[int, int, int],  # voxel size in ZYX order
-    voxel_units: str,  # The size units of a voxel
-    shape_zyx: Tuple[int, int, int],
-    resolution: int = 0,
-    raw_data: np.array = None,
-    data_extension: Optional[str] = "",  # Can omit if uploading every file in dir
-    upload_increment: Optional[int] = 32,  # How many z slices to upload at once
-    retry_max: Optional[int] = 3,  # Number of retries to upload a single
-    dtype: Optional[str] = "uint8",  # Data-type of the image data. "uint8" or "uint64"
-    overwrite: Optional[bool] = False,  # Overwrite existing data
-    source_channel: Optional[str] = None,  # What to name a new channel
-):
-    # TODO: Move comments to full docstring
-    # upload_increment (int):  For best performance, use be a multiple of 16.
-    #   With a lot of RAM, 64. If out-of-memory errors, decrease to 16. If issues
-    #   persist, try 8 or 4.
+class BossDBUpload:
+    def __init__(
+        self,
+        url: str,
+        data_dir: str,  # Local absolute path
+        voxel_size: Tuple[int, int, int],  # voxel size in ZYX order
+        voxel_units: str,  # The size units of a voxel
+        shape_zyx: Tuple[int, int, int],
+        resolution: int = 0,
+        raw_data: np.array = None,
+        data_extension: Optional[str] = "",  # Can omit if uploading every file in dir
+        upload_increment: Optional[int] = 32,  # How many z slices to upload at once
+        retry_max: Optional[int] = 3,  # Number of retries to upload a single
+        dtype: Optional[str] = "uint8",  # type of the image data. e.g., uint8, uint64
+        overwrite: Optional[bool] = False,  # Overwrite existing data
+    ):
+        # TODO: Move comments to full docstring
+        # upload_increment (int):  For best performance, use be a multiple of 16.
+        #   With a lot of RAM, 64. If out-of-memory errors, decrease to 16. If issues
+        #   persist, try 8 or 4.
 
-    url_exist = BossDBInterface(url).exists
-    if not overwrite and url_exist:
-        logger.warning(
-            f"Dataset exists already exists at {url}\n"
-            + " To overwrite, set `overwrite` to True"
-        )
-        return
+        self._url = url
+        self.url_bits = _parse_bossdb_uri(url)
+        self._data_dir = data_dir
+        self._voxel_size = tuple(float(i) for i in voxel_size)
+        self._voxel_units = voxel_units
+        self._shape_zyx = tuple(int(i) for i in shape_zyx)
+        self._resolution = resolution
+        self._raw_data = raw_data
+        self._data_extension = data_extension
+        self._upload_increment = upload_increment
+        self._retry_max = retry_max
+        self._dtype = dtype
+        self._overwrite = overwrite
+        self.description = "Uploaded via DataJoint"
+        self._resources = dict()
 
-    boss_dataset = BossDBInterface(
-        url,
-        resolution=resolution,
-        volume_provider=_BossDBVolumeProvider(),
-        description="Uploaded via DataJoint",
-        extents=shape_zyx,
-        dtype=dtype,
-        voxel_size=voxel_size,
-        voxel_unit=voxel_units,
-        create_new=not url_exist,  # If the url does not exist, create new
-        source_channel=source_channel if source_channel else None,
-    )
-    """
-    > /Users/cb/Documents/dev/intern/intern/service/boss/v1/project.py(759)create()
-    757         req = self.get_request(resource, 'POST', 'application/json', url_prefix, auth, json=json)
-    758
---> 759         prep = session.prepare_request(req)
-    760         resp = session.send(prep, **send_opts)
-    761
+        self.url_exists = BossDBInterface(self._url).exists
+        if not overwrite and self.url_exists:
+            logger.warning(
+                f"Dataset exists already exists at {self._url}\n"
+                + " To overwrite, set `overwrite` to True"
+            )
+            return
 
-    ipdb> json
-    {'name': 'CF_DataJointTest_test', 'description': 'Uploaded via DataJoint', 'x_start': 0, 'x_stop': 246, 'y_start': 0, 'y_stop': 246, 'z_start': 0, 'z_stop': 20, 'x_voxel_size': 0.5, 'y_voxel_size': 0.5, 'z_voxel_size': 1.0, 'voxel_unit': 'micrometers'}
-    ipdb> # TypeError: Object of type int64 is not JSON serializable
-    """
+        if not self.url_exists:
+            self.try_create_new()
 
-    if not raw_data:
-        image_paths = sorted(data_dir.glob("*" + data_extension))
+        if self._raw_data is None:
+            self._image_paths = self.fetch_images()
+
+    def fetch_images(self):
+        image_paths = sorted(self._data_dir.glob("*" + self._data_extension))
         if not image_paths:
             raise DataJointError(
-                "No images found in the specified directory "
-                + f"{data_dir}/*{data_extension}."
+                "No files found in the specified directory "
+                + f"{self._data_dir}/*{self._data_extension}."
             )
+        return image_paths
 
-    z_max = shape_zyx[0]
-    for i in tqdm(range(0, z_max, upload_increment)):
-        z_limit = min(i + upload_increment, z_max)  # whichever smaller incriment or end
-
-        stack = (
-            raw_data[i:z_limit]
-            if raw_data
-            else _np_from_images(image_paths, i, z_limit, dtype)
+    @property
+    def dataset(self):
+        # int/float typing below bc upload had issues with json serializing np.int64
+        return BossDBInterface(
+            self._url,
+            resolution=self._resolution,
+            volume_provider=_BossDBVolumeProvider(),
+            description=self.description,
+            extents=self._shape_zyx,
+            dtype=self._dtype,
+            voxel_size=self._voxel_size,
+            voxel_unit=self._voxel_units,
+            create_new=not self.url_exists,  # If the url does not exist, create new
+            source_channel=self.url_bits.channel,
         )
 
-        retry_count = 0
+    def upload(self):
+        z_max = self._shape_zyx[0]
+        for i in tqdm(range(0, z_max, self._upload_increment)):
+            # whichever smaller increment or end
+            z_limit = min(i + self._upload_increment, z_max)
 
-        while True:
-            try:
-                boss_dataset[
-                    i : i + stack.shape[0],
-                    0 : stack.shape[1],
-                    0 : stack.shape[2],
-                ] = stack
-                break
-            except Exception as e:
-                logger.error(f"Error uploading chunk {i}-{i + stack.shape[0]}: {e}")
-                retry_count += 1
-                if retry_count > retry_max:
-                    raise e
-                logger.info(f"Retrying increment {i} ...{retry_count}/{retry_max}")
-                continue
+            stack = (
+                self._raw_data[i:z_limit]
+                if self._raw_data is not None
+                else self._np_from_images(self._image_paths, i, z_limit, self._dtype)
+            )
+            stack_shape = stack.shape
 
+            retry_count = 0
 
-def _np_from_images(image_paths, i, z_limit, dtype):
-    return np.stack(
-        [
-            np.array(image, dtype=dtype)
-            for image in [Image.open(path) for path in image_paths[i:z_limit]]
-        ],
-        axis=0,
-    )
+            while True:
+                try:
+                    self.dataset[
+                        i : i + stack_shape[0],
+                        0 : stack_shape[1],
+                        0 : stack_shape[2],
+                    ] = stack
+                    break
+                except Exception as e:
+                    logger.error(f"Error uploading chunk {i}-{i + stack_shape[0]}: {e}")
+                    retry_count += 1
+                    if retry_count > self._retry_max:
+                        raise e
+                    logger.info(
+                        f"Retrying increment {i}...{retry_count}/{self._retry_max}"
+                    )
+                    continue
+        # [2023-02-10 15:45:31,648][ERROR]: Error uploading chunk 0-20: ndarray is not C-contiguous
+
+    def _np_from_images(self, image_paths, i, z_limit, dtype):
+        return np.stack(
+            [
+                np.array(image, dtype=dtype)
+                for image in [Image.open(path) for path in image_paths[i:z_limit]]
+            ],
+            axis=0,
+        )
+
+    @property
+    def resources(self):
+        # Default resources for creating channels
+        coord_name = f"CF_{self.url_bits.collection}_{self.url_bits.experiment}"
+        if not self._resources:
+            self._resources = dict(
+                collection=CollectionResource(
+                    name=self.url_bits.collection, description=self.description
+                ),
+                coord_frame=CoordinateFrameResource(
+                    name=coord_name,
+                    description=self.description,
+                    x_start=0,
+                    x_stop=self._shape_zyx[2],
+                    y_start=0,
+                    y_stop=self._shape_zyx[1],
+                    z_start=0,
+                    z_stop=self._shape_zyx[0],
+                    x_voxel_size=self._voxel_size[2],
+                    y_voxel_size=self._voxel_size[1],
+                    z_voxel_size=self._voxel_size[0],
+                ),
+                experiment=ExperimentResource(
+                    name=self.url_bits.experiment,
+                    collection_name=self.url_bits.collection,
+                    coord_frame=coord_name,
+                    description=self.description,
+                ),
+                channel_resource=ChannelResource(
+                    name=self.url_bits.channel,
+                    collection_name=self.url_bits.collection,
+                    experiment_name=self.url_bits.experiment,
+                    type="image",
+                    description=self.description,
+                    datatype=self._dtype,
+                ),
+                channel=ChannelResource(
+                    name=self.url_bits.channel,
+                    collection_name=self.url_bits.collection,
+                    experiment_name=self.url_bits.experiment,
+                    type="image",
+                    description=self.description,
+                    datatype=self._dtype,
+                    sources=[],
+                ),
+            )
+        return self._resources
+
+    def try_create_new(self):
+        remote = BossRemote()
+
+        # Make collection
+        _ = self._get_or_create(remote=remote, obj=self.resources["collection"])
+
+        # Make coord frame
+        true_coord_frame = self._get_or_create(
+            remote=remote, obj=self.resources["coord_frame"]
+        )
+
+        # Set Experiment based on coord frame
+        experiment = self.resources["experiment"]
+        experiment.coord_frame = true_coord_frame.name
+        _ = self._get_or_create(remote=remote, obj=experiment)
+
+        # Set channel based on resource
+        channel_resource = self._get_or_create(
+            remote=remote, obj=self.resources["channel_resource"]
+        )
+        channel = self.resources["channel"]
+        channel.sources = [channel_resource.name]
+        _ = self._get_or_create(remote=remote, obj=channel)
+
+    def _get_or_create(self, remote, obj):
+        try:
+            result = remote.get_project(obj)
+        except HTTPError:
+            logger.info(f"Creating {obj.name}")
+            result = remote.create_project(obj)
+        return result
