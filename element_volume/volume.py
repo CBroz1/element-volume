@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Optional
 
 import datajoint as dj
+import numpy as np
 from element_interface.utils import dict_to_uuid, find_full_path
+from numpy.typing import DTypeLike
 
 from .export.bossdb import BossDBUpload
 from .readers.bossdb import BossDBInterface
@@ -152,16 +154,30 @@ class Volume(dj.Manual):
         session_key: Optional[dict] = None,
         upload_from: Optional[str] = "table",
         data_dir: Optional[str] = None,
+        dtype: Optional[DTypeLike] = None,
         **kwargs,
     ):
         # NOTE: uploading from data_dir (local rel path) assumes 1 image per z slice
         # If not upload_from 'table', upload files in data_dir
 
-        if not data_dir and session_key:
-            data_dir = find_full_path(
-                get_vol_root_data_dir(),
-                get_session_directory(session_key),
-            )
+        if upload_from == "table":
+            data = (Volume & volume_key).fetch1("volume_data")
+            dtype = data.dtype
+        else:  # Uploading from image files
+            data = None
+
+            if not dtype:
+                raise ValueError("Must specify dtype when loading data from images")
+            elif isinstance(dtype, str):
+                dtype = np.dtype(dtype)
+
+            if not data_dir and session_key:
+                data_dir = find_full_path(
+                    get_vol_root_data_dir(),
+                    get_session_directory(session_key),
+                )
+            if not Path(data_dir).is_absolute():
+                raise ValueError(f"Could not find absolute path to data: {data_dir}")
 
         (
             url,
@@ -185,11 +201,6 @@ class Volume(dj.Manual):
             "voxel_unit",
         )
 
-        if upload_from == "table":
-            data = (Volume & volume_key).fetch1("volume_data")
-        else:
-            data = None
-
         bossdb = BossDBUpload(
             url=url,
             raw_data=data,
@@ -198,6 +209,7 @@ class Volume(dj.Manual):
             voxel_units=voxel_unit,
             shape_zyx=(int(i) for i in (z_size, y_size, x_size)),
             resolution=downsampling,
+            dtype=dtype,
             **kwargs,
         )
         bossdb.upload()

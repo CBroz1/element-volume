@@ -4,7 +4,9 @@
     "version": "0.2", // Version of the setting file.  Always 0.2
     "language": "en", // language - current active spelling language
     "enabledLanguageIds": [
-        "markdown", "yaml", "python"
+        "markdown",
+        "yaml",
+        "python"
     ],
     // flagWords - list of words to be always considered incorrect
     // This is useful for offensive words and common spelling errors.
@@ -16,29 +18,28 @@
         "./images/*"
     ],
     "words": [
-        "Berens",
-        "Connectome",
-        "connectome",
-        "bossdb",
-        "DBURLs",
-        "voxel",
-        "dtype",
         "aggr",
-        "tqdm",
-        "ipdb",
-        "pngs",
-        "ndarrays",
+        "ascontiguousarray",
         "astype",
+        "Berens",
+        "bossdb",
         "CICD",
+        "connectome",
+        "Connectome",
+        "DBURLs",
+        "dtype",
         "Ecker",
         "elif",
         "Ephys",
         "Hoenselaar",
         "IACUC",
         "inlinehilite",
+        "ipdb",
         "linenums",
         "mkdocs",
         "mkdocstrings",
+        "ndarrays",
+        "pngs",
         "pymdownx",
         "Reimer",
         "Roboto",
@@ -50,6 +51,8 @@
         "Sinz",
         "Sitonic",
         "Tolias",
+        "tqdm",
+        "voxel",
         "Yatsenko",
         "Zuckerman"
     ]

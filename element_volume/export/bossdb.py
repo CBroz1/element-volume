@@ -33,7 +33,7 @@ class BossDBUpload:
         data_extension: Optional[str] = "",  # Can omit if uploading every file in dir
         upload_increment: Optional[int] = 32,  # How many z slices to upload at once
         retry_max: Optional[int] = 3,  # Number of retries to upload a single
-        dtype: Optional[str] = "uint8",  # type of the image data. e.g., uint8, uint64
+        dtype: Optional[str] = None,  # type of the image data. e.g., uint8, uint64
         overwrite: Optional[bool] = False,  # Overwrite existing data
     ):
         # TODO: Move comments to full docstring
@@ -41,6 +41,7 @@ class BossDBUpload:
         #   With a lot of RAM, 64. If out-of-memory errors, decrease to 16. If issues
         #   persist, try 8 or 4.
 
+        # int/float typing bc upload had issues with json serializing np.int64
         self._url = url
         self.url_bits = _parse_bossdb_uri(url)
         self._data_dir = data_dir
@@ -70,6 +71,8 @@ class BossDBUpload:
 
         if self._raw_data is None:
             self._image_paths = self.fetch_images()
+        else:
+            self._dtype = self._raw_data.dtype
 
     def fetch_images(self):
         image_paths = sorted(self._data_dir.glob("*" + self._data_extension))
@@ -82,7 +85,6 @@ class BossDBUpload:
 
     @property
     def dataset(self):
-        # int/float typing below bc upload had issues with json serializing np.int64
         return BossDBInterface(
             self._url,
             resolution=self._resolution,
@@ -107,6 +109,10 @@ class BossDBUpload:
                 if self._raw_data is not None
                 else self._np_from_images(self._image_paths, i, z_limit, self._dtype)
             )
+
+            if not stack.flags["C_CONTIGUOUS"]:
+                stack = np.ascontiguousarray(stack)
+
             stack_shape = stack.shape
 
             retry_count = 0
@@ -128,7 +134,9 @@ class BossDBUpload:
                         f"Retrying increment {i}...{retry_count}/{self._retry_max}"
                     )
                     continue
-        # [2023-02-10 15:45:31,648][ERROR]: Error uploading chunk 0-20: ndarray is not C-contiguous
+        # 'Create cutout failed on CalciumImaging, got HTTP response: (400) - {"status":
+        # 400, "code": 2002, "message": "Failed to unpack data. Verify the datatype of
+        # your POSTed data and xyz dimensions used in the POST URL."}'
 
     def _np_from_images(self, image_paths, i, z_limit, dtype):
         return np.stack(
