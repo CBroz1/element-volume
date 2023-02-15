@@ -39,6 +39,7 @@
         "mkdocs",
         "mkdocstrings",
         "ndarrays",
+        "neuroglancer",
         "pngs",
         "pymdownx",
         "Reimer",

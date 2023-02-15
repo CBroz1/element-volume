@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 from datajoint.errors import DataJointError
-from intern.convenience.array import _BossDBVolumeProvider, _parse_bossdb_uri
+from intern.convenience.array import _parse_bossdb_uri
 from intern.remote.boss import BossRemote
 from intern.resource.boss.resource import (
     ChannelResource,
@@ -31,7 +31,7 @@ class BossDBUpload:
         resolution: int = 0,
         raw_data: np.array = None,
         data_extension: Optional[str] = "",  # Can omit if uploading every file in dir
-        upload_increment: Optional[int] = 32,  # How many z slices to upload at once
+        upload_increment: Optional[int] = 16,  # How many z slices to upload at once
         retry_max: Optional[int] = 3,  # Number of retries to upload a single
         dtype: Optional[str] = None,  # type of the image data. e.g., uint8, uint64
         overwrite: Optional[bool] = False,  # Overwrite existing data
@@ -53,7 +53,6 @@ class BossDBUpload:
         self._data_extension = data_extension
         self._upload_increment = upload_increment
         self._retry_max = retry_max
-        self._dtype = dtype
         self._overwrite = overwrite
         self.description = "Uploaded via DataJoint"
         self._resources = dict()
@@ -69,10 +68,11 @@ class BossDBUpload:
         if not self.url_exists:
             self.try_create_new()
 
-        if self._raw_data is None:
+        if self._raw_data is None:  # 'is None' bc np.array as ambiguous truth value
             self._image_paths = self.fetch_images()
+            self._dtype = dtype or None
         else:
-            self._dtype = self._raw_data.dtype
+            self._dtype = dtype or self._raw_data.dtype
 
     def fetch_images(self):
         image_paths = sorted(self._data_dir.glob("*" + self._data_extension))
@@ -87,15 +87,15 @@ class BossDBUpload:
     def dataset(self):
         return BossDBInterface(
             self._url,
-            resolution=self._resolution,
-            volume_provider=_BossDBVolumeProvider(),
-            description=self.description,
             extents=self._shape_zyx,
             dtype=self._dtype,
+            resolution=self._resolution,
             voxel_size=self._voxel_size,
             voxel_unit=self._voxel_units,
-            create_new=not self.url_exists,  # If the url does not exist, create new
+            create_new=True,  # not self.url_exists,  # If the url does not exist, create new
             source_channel=self.url_bits.channel,
+            # volume_provider=_BossDBVolumeProvider(),
+            # description=self.description,
         )
 
     def upload(self):
@@ -107,7 +107,7 @@ class BossDBUpload:
             stack = (
                 self._raw_data[i:z_limit]
                 if self._raw_data is not None
-                else self._np_from_images(self._image_paths, i, z_limit, self._dtype)
+                else self._np_from_images(i, z_limit)
             )
 
             if not stack.flags["C_CONTIGUOUS"]:
@@ -138,11 +138,11 @@ class BossDBUpload:
         # 400, "code": 2002, "message": "Failed to unpack data. Verify the datatype of
         # your POSTed data and xyz dimensions used in the POST URL."}'
 
-    def _np_from_images(self, image_paths, i, z_limit, dtype):
+    def _np_from_images(self, i, z_limit):
         return np.stack(
             [
-                np.array(image, dtype=dtype)
-                for image in [Image.open(path) for path in image_paths[i:z_limit]]
+                np.array(image, dtype=self._dtype)
+                for image in [Image.open(path) for path in self._image_paths[i:z_limit]]
             ],
             axis=0,
         )

@@ -101,3 +101,13 @@ class BossDBURLs(dj.Lookup):
                     {**master_key, "url": con_url},
                     skip_duplicates=skip_duplicates,
                 )
+
+    @classmethod
+    def return_neuroglancer_url(cls, key, table="Volume"):
+        url = (getattr(cls, table) & key).fetch1("url")
+
+        return (
+            "https://neuroglancer.bossdb.io/#!{'layers':{'image':{'source':'"
+            + url
+            + "'}}}"
+        )

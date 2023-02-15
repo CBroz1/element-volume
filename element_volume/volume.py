@@ -162,14 +162,12 @@ class Volume(dj.Manual):
 
         if upload_from == "table":
             data = (Volume & volume_key).fetch1("volume_data")
-            dtype = data.dtype
+            dtype = dtype or data.dtype  # if provided, fetch from
         else:  # Uploading from image files
             data = None
 
             if not dtype:
                 raise ValueError("Must specify dtype when loading data from images")
-            elif isinstance(dtype, str):
-                dtype = np.dtype(dtype)
 
             if not data_dir and session_key:
                 data_dir = find_full_path(
@@ -178,6 +176,11 @@ class Volume(dj.Manual):
                 )
             if not Path(data_dir).is_absolute():
                 raise ValueError(f"Could not find absolute path to data: {data_dir}")
+
+        if isinstance(dtype, str):
+            dtype = np.dtype(dtype)
+        if dtype and dtype not in [np.dtype("uint8"), np.dtype("uint16")]:
+            raise ValueError("BossDB only accepts uint8 or uint16 image data.")
 
         (
             url,
